@@ -1,0 +1,5 @@
+pygame>=2.5.0 # pour l'interface
+torch>=2.0.0 # pour machine learning
+numpy>=1.24.0 #la base du calcul scientifique
+matplotlib>=3.7.0 ##créer des graphiques
+seaborn>=0.12.0 ##Graphiques plus beaux
