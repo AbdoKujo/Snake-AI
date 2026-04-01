@@ -64,23 +64,29 @@ SPLIT_CELL_SIZE: int = 15
 ASTAR_VISUALIZE_PATH: bool = True  # Afficher le chemin calculé
 
 # =============================================================================
-# PARAMÈTRES DQN
+# PARAMÈTRES DQN — CNN grid input (Phase 2)
 # =============================================================================
+# State: 3-channel grid (body gradient / food / free space), flattened.
+# Network: Conv2d × 3 → FC trunk → Dueling heads (V + A).
+# input_size = channels × GRID_HEIGHT × GRID_WIDTH = 3 × 25 × 30 = 2 250
 DQN_CONFIG: Dict = {
-    "learning_rate": 1e-3,
-    "gamma": 0.99,                   # effective horizon ~100 steps — stable for Snake
+    "learning_rate": 1e-4,           # lower LR — CNN is more sensitive than MLP
+    "gamma": 0.99,
     "epsilon_start": 1.0,
-    "epsilon_end": 0.02,             # less noise in late training
-    "epsilon_decay_steps": 30_000,
+    "epsilon_end": 0.02,
+    "epsilon_decay_steps": 100_000,  # more exploration needed for richer state space
     "epsilon_decay_type": "exponential",
-    "batch_size": 512,
+    "batch_size": 1024,              # larger batch → GPU stays busy per call
     "target_update_freq": 1_000,     # only used when tau=0 (hard copy fallback)
-    "max_memory_size": 100_000,
-    "train_start_size": 20_000,
-    "hidden_size": 512,              # wider streams for Dueling (256 each)
-    "input_size": 14,
+    "max_memory_size": 100_000,      # ~900 MB RAM — more diverse experiences
+    "train_start_size": 1_000,       # fill buffer before first gradient step
+    "hidden_size": 512,              # shared FC trunk size (streams = 256 each)
+    "input_size": 3 * 25 * 30,       # 2250 — flat state dim for replay buffer
+    "grid_height": 25,               # must match GRID_HEIGHT
+    "grid_width":  30,               # must match GRID_WIDTH
+    "channels":    3,                # body / food / free-space
     "output_size": 4,
-    "gradient_clip_norm": 1.0,
+    "gradient_clip_norm": 10.0,      # CNNs tolerate higher clip than MLPs
     "double_dqn": True,
     "tau": 0.005,                    # Polyak soft target update (0 = hard copy)
     "lr_scheduler_patience": 20,     # (legacy — unused with cosine schedule)
@@ -88,23 +94,25 @@ DQN_CONFIG: Dict = {
     "lr_min": 1e-5,
     "lr_total_steps": 500_000,       # cosine LR annealing T_max
     # Prioritized Experience Replay
-    "per_alpha":       0.6,          # 0 = uniform, 1 = fully prioritised
-    "per_beta_start":  0.4,          # IS correction start (anneals to 1.0)
-    "per_beta_frames": 100_000,      # steps to reach β = 1.0
-    "per_epsilon":     1e-6,         # small constant to avoid zero priority
+    "per_alpha":       0.6,
+    "per_beta_start":  0.4,
+    "per_beta_frames": 100_000,
+    "per_epsilon":     1e-6,
 }
 
 # =============================================================================
 # RÉCOMPENSES DQN
 # =============================================================================
 REWARD_SCHEME: Dict[str, float] = {
-    "eat_food":       10.0,
-    "milestone":       5.0,   # bonus every 10 lengths grown (gradient signal)
-    "die_base":      -10.0,   # base death penalty
-    "die_per_cell":   -0.1,   # extra per body cell — scales with progress lost
-    "win":           100.0,
-    "step_factor":    -0.03,  # divided by snake_length → short=-0.01, long→0
-    "timeout":       -10.0,   # same as death — looping is total failure
+    # 4-signal policy — stable Q-targets, no hidden variables, no length scaling
+    "eat_food":  10.0,   # flat food reward
+    "die":      -10.0,   # flat death (wall or body — no distinction)
+    "win":      100.0,   # fills the grid
+    "approach":   0.1,   # ÷ snake_len per step (self-fading: +0.033 early → +0.001 late)
+    "retreat":   -0.2,   # ÷ snake_len per step (asymmetric — oscillation always net < 0)
+    # Oscillation at len=3: (+0.033 - 0.067)/2 = -0.017/step → unprofitable
+    # Hard per-food step cap is set per curriculum stage (see CURRICULUM_STAGES)
+    "timeout":  -10.0,   # per-food cap exceeded — same as death
 }
 
 # =============================================================================
@@ -112,10 +120,22 @@ REWARD_SCHEME: Dict[str, float] = {
 # =============================================================================
 TRAINING_CONFIG: Dict = {
     "num_episodes":           1000,
-    "max_steps_per_episode":  1500,   # GRID_WIDTH * GRID_HEIGHT * 2 — prevents loops
+    "max_steps_per_episode":  4500,   # GRID_WIDTH * GRID_HEIGHT * 6 — absolute ceiling
     "visualize_every":        50,     # render one episode every N; 0 = disabled
     "train_freq":             2,      # call agent.train() every N steps
 }
+
+# =============================================================================
+# CURRICULUM — stage thresholds for parallel training
+# Steps-per-food cap relaxes as the agent improves, mimicking progressive difficulty.
+# CurriculumTrainer advances automatically when avg(last 100) crosses threshold.
+# =============================================================================
+CURRICULUM_STAGES: list = [
+    # name                         steps_per_food        advance when avg >
+    {"name": "Stage 1 — Survival",    "steps_per_food": 750,   "threshold": 5},
+    {"name": "Stage 2 — Navigation",  "steps_per_food": 1500,  "threshold": 15},
+    {"name": "Stage 3 — Full game",   "steps_per_food": 3000,  "threshold": 99999},
+]
 
 # =============================================================================
 # PARAMÈTRES BASE DE DONNÉES

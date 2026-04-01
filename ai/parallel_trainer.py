@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import pickle
 import queue as _queue
 import random
 import time
@@ -59,12 +60,18 @@ def _env_worker(
     from game.direction import Direction
     from ai.neural_network import NeuralNetwork
 
-    gw        = config["grid_width"]
-    gh        = config["grid_height"]
-    max_steps = config["max_steps"]
+    gw              = config["grid_width"]
+    gh              = config["grid_height"]
+    max_steps       = config["max_steps"]
+    steps_per_food  = config.get("steps_per_food", 0)   # 0 = disabled
 
     game = GameState(gw, gh)
-    net  = NeuralNetwork(config["input_size"], config["hidden_size"], config["output_size"])
+    net  = NeuralNetwork(
+        config["input_size"], config["hidden_size"], config["output_size"],
+        grid_height=config["grid_height"],
+        grid_width =config["grid_width"],
+        channels   =config["channels"],
+    )
     net.eval()
     cpu = torch.device("cpu")
 
@@ -84,7 +91,10 @@ def _env_worker(
         while True:
             try:
                 msg = weight_recv.get_nowait()
-                net.load_state_dict(msg)
+                # msg is pre-pickled bytes (serialised once in main process)
+                # → workers only pay the unpickle cost, not the pickle cost
+                sd = pickle.loads(msg) if isinstance(msg, (bytes, bytearray)) else msg
+                net.load_state_dict(sd)
             except _queue.Empty:
                 break
             except Exception:
@@ -92,9 +102,11 @@ def _env_worker(
 
         # --- run one episode -----------------------------------------------
         game.reset()
-        state = game.get_state_representation()
-        done  = False
-        steps = 0
+        state           = game.get_state_representation()
+        done            = False
+        steps           = 0
+        steps_since_food = 0
+        prev_score      = 0
 
         while not done and not stop_event.is_set():
             # epsilon-greedy action selection (CPU only)
@@ -106,8 +118,20 @@ def _env_worker(
 
             action = Direction.from_index(action_idx)
             done, reward = game.update(action)
-            steps += 1
+            steps            += 1
+            steps_since_food += 1
 
+            # Detect food eaten by score increase → reset per-food counter
+            if game.score > prev_score:
+                prev_score       = game.score
+                steps_since_food = 0
+
+            # Hard per-food step cap (curriculum stage timeout)
+            if steps_per_food > 0 and steps_since_food >= steps_per_food and not done:
+                reward = -10.0
+                done   = True
+
+            # Hard per-episode step cap
             if max_steps > 0 and steps >= max_steps and not done:
                 reward += -10.0
                 done = True
@@ -170,11 +194,12 @@ class ParallelTrainer:
         self,
         num_episodes:      int  = 1000,
         max_steps:         int  = 1500,
+        steps_per_food:    int  = 0,        # 0 = disabled; curriculum sets this per stage
         train_freq:        int  = 2,
         log_interval:      int  = 10,
         save_path:         str  = "saved_models/dqn_model.pt",
         checkpoint_every:  int  = 100,
-        weight_sync_every: int  = 50,
+        weight_sync_every: int  = 200,
         visualize_every:   int  = 0,
         visualize_fn:      Optional[Callable] = None,
         on_log:            Optional[Callable] = None,
@@ -221,7 +246,9 @@ class ParallelTrainer:
             "input_size":         agent.input_size,
             "hidden_size":        agent.hidden_size,
             "output_size":        agent.output_size,
+            "channels":           agent.channels,
             "max_steps":          max_steps,
+            "steps_per_food":     steps_per_food,
             "initial_state_dict": sd_cpu,
         }
 
@@ -410,16 +437,13 @@ class ParallelTrainer:
                 train_t0 = time.time()
                 num_trains_done = 0
                 if new_exps > 0:
-                    # Hard cap: never do more gradient steps per cycle than
-                    # would sample each buffer item once on average.
-                    # Prevents catastrophic over-fitting when the buffer is small
-                    # (e.g. 1024 steps × batch 512 from a 5k buffer = every
-                    # sample used 105× in one cycle, which destroys learning).
-                    # As the buffer grows to 100k this cap rises to ~195 and
-                    # the raw new_exps//train_freq formula naturally takes over.
-                    buffer_capacity = max(1, len(agent.memory) // agent.batch_size)
-                    num_trains = min(max(1, new_exps // train_freq),
-                                     buffer_capacity, 1024)
+                    # Hard cap per cycle: keeps each cycle ≤ ~500 ms so the
+                    # exp_queue never saturates and workers never block.
+                    # At 60 ms/step, 8 steps = 480 ms → workers generate
+                    # ~1500 new experiences in that window → queue stays empty.
+                    # (Old buffer_capacity cap grew unbounded as the buffer
+                    # filled, causing 7-second cycles that flooded the queue.)
+                    num_trains = min(max(1, new_exps // train_freq), 8)
                     for _ in range(num_trains):
                         loss = agent.train()
                         if loss is not None:
@@ -437,9 +461,13 @@ class ParallelTrainer:
                 if train_steps >= next_sync:
                     sd = {k: v.cpu().clone()
                           for k, v in agent.policy_net.state_dict().items()}
+                    # Pickle ONCE — send the same bytes object to every worker.
+                    # With a 23 MB CNN state dict, this saves 8× pickle cost vs
+                    # calling put_nowait(sd) separately (which pickles per call).
+                    sd_bytes = pickle.dumps(sd)
                     for wq in weight_queues:
                         try:
-                            wq.put_nowait(sd)
+                            wq.put_nowait(sd_bytes)
                         except _queue.Full:
                             pass  # worker hasn't read last update; next sync will push fresh weights
                     next_sync = train_steps + weight_sync_every

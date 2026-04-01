@@ -34,31 +34,34 @@ class DQNAgent(BaseAgent):
     
     def __init__(
         self,
-        input_size: int = 11,
-        hidden_size: int = 256,
-        output_size: int = 4,
-        learning_rate: float = 1e-3,
-        gamma: float = 0.99,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.05,
-        epsilon_decay_steps: int = 50_000,
-        epsilon_decay_type: str = "linear",
-        batch_size: int = 64,
-        target_update_freq: int = 1_000,
-        max_memory_size: int = 100_000,
-        train_start_size: int = 1_000,
-        gradient_clip_norm: float = 1.0,
-        double_dqn: bool = True,
-        per_alpha: float = 0.6,
-        per_beta_start: float = 0.4,
-        per_beta_frames: int = 100_000,
-        per_epsilon: float = 1e-6,
-        tau: float = 0.005,
-        lr_scheduler_patience: int = 20,
-        lr_scheduler_factor: float = 0.5,
-        lr_min: float = 1e-5,
-        lr_total_steps: int = 50_000,
-        device: Optional[str] = None
+        input_size:          int   = 2250,
+        hidden_size:         int   = 512,
+        output_size:         int   = 4,
+        grid_height:         int   = 25,
+        grid_width:          int   = 30,
+        channels:            int   = 3,
+        learning_rate:       float = 1e-4,
+        gamma:               float = 0.99,
+        epsilon_start:       float = 1.0,
+        epsilon_end:         float = 0.02,
+        epsilon_decay_steps: int   = 100_000,
+        epsilon_decay_type:  str   = "exponential",
+        batch_size:          int   = 256,
+        target_update_freq:  int   = 1_000,
+        max_memory_size:     int   = 50_000,
+        train_start_size:    int   = 10_000,
+        gradient_clip_norm:  float = 10.0,
+        double_dqn:          bool  = True,
+        per_alpha:           float = 0.6,
+        per_beta_start:      float = 0.4,
+        per_beta_frames:     int   = 100_000,
+        per_epsilon:         float = 1e-6,
+        tau:                 float = 0.005,
+        lr_scheduler_patience: int   = 20,
+        lr_scheduler_factor:   float = 0.5,
+        lr_min:              float = 1e-5,
+        lr_total_steps:      int   = 500_000,
+        device:              Optional[str] = None,
     ) -> None:
         """
         Initialise l'agent DQN.
@@ -89,14 +92,18 @@ class DQNAgent(BaseAgent):
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"DQN Agent using device: {self.device}")
 
-        # Let cuDNN auto-tune kernel selection for fixed-size inputs
+        # cudnn.benchmark causes slow first-call kernel search for tiny (3×25×30)
+        # inputs where CUDA overhead dominates — leave it off.
         if self.device.type == "cuda":
-            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.benchmark = False
         
         # Hyperparamètres
-        self.input_size = input_size
+        self.input_size  = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
+        self.grid_height = grid_height
+        self.grid_width  = grid_width
+        self.channels    = channels
         self.learning_rate = learning_rate
         self.gamma = gamma
         self.epsilon_start = epsilon_start
@@ -115,9 +122,15 @@ class DQNAgent(BaseAgent):
         self.epsilon = epsilon_start
         self.global_step = 0
         
-        # Réseaux de neurones
-        self.policy_net = NeuralNetwork(input_size, hidden_size, output_size).to(self.device)
-        self.target_net = NeuralNetwork(input_size, hidden_size, output_size).to(self.device)
+        # Réseaux de neurones (CNN — grid_height × grid_width × channels)
+        self.policy_net = NeuralNetwork(
+            input_size, hidden_size, output_size,
+            grid_height=grid_height, grid_width=grid_width, channels=channels,
+        ).to(self.device)
+        self.target_net = NeuralNetwork(
+            input_size, hidden_size, output_size,
+            grid_height=grid_height, grid_width=grid_width, channels=channels,
+        ).to(self.device)
         self.update_target_network()  # Synchroniser les poids
         self.target_net.eval()  # Target network en mode évaluation
 
@@ -140,9 +153,10 @@ class DQNAgent(BaseAgent):
             per_epsilon = per_epsilon,
         )
         
-        # Mixed precision (AMP) — GPU only
-        self._use_amp = (self.device.type == "cuda")
-        self.scaler   = torch.amp.GradScaler("cuda", enabled=self._use_amp)
+        # AMP disabled: for tiny (3×25×30) inputs the fp16 type-cast overhead
+        # is larger than the compute saving — AMP makes training 3× SLOWER here.
+        self._use_amp = False
+        self.scaler   = torch.amp.GradScaler("cuda", enabled=False)
 
         # Statistiques d'entraînement
         self.training_losses: list[float] = []
@@ -171,6 +185,44 @@ class DQNAgent(BaseAgent):
             action_idx = self.policy_net.predict(state, self.device)
 
         return Direction.from_index(action_idx)
+
+    def get_actions_batch(self, states: np.ndarray,
+                          epsilons: np.ndarray) -> np.ndarray:
+        """
+        Batch epsilon-greedy action selection for N environments.
+
+        One GPU forward pass for all non-exploring envs → eliminates
+        N separate GPU round trips (each with ~5 ms CUDA overhead).
+
+        Args:
+            states:   (N, input_size) float32 — one state per env.
+            epsilons: (N,)  float    — per-env epsilon (Ape-X spread).
+
+        Returns:
+            (N,) int64 array of action indices.
+        """
+        N       = len(states)
+        actions = np.empty(N, dtype=np.int64)
+
+        explore = np.random.random(N) < epsilons        # bool mask
+        exploit = ~explore
+
+        # Random actions for exploring envs (pure CPU, no GPU call)
+        n_explore = int(explore.sum())
+        if n_explore:
+            actions[explore] = np.random.randint(0, self.output_size, n_explore)
+
+        # Single batched GPU forward pass for exploiting envs
+        n_exploit = N - n_explore
+        if n_exploit:
+            with torch.no_grad():
+                self.policy_net.eval()
+                t = torch.as_tensor(states[exploit], device=self.device)
+                q  = self.policy_net(t)
+                actions[exploit] = q.argmax(dim=1).cpu().numpy()
+            self.policy_net.train()
+
+        return actions
     
     def remember(
         self,
@@ -321,9 +373,12 @@ class DQNAgent(BaseAgent):
             'epsilon':     self.epsilon,
             'global_step': self.global_step,
             'hyperparameters': {
-                'input_size': self.input_size,
+                'input_size':  self.input_size,
                 'hidden_size': self.hidden_size,
                 'output_size': self.output_size,
+                'grid_height': self.grid_height,
+                'grid_width':  self.grid_width,
+                'channels':    self.channels,
                 'learning_rate': self.learning_rate,
                 'gamma': self.gamma,
                 'epsilon_start': self.epsilon_start,

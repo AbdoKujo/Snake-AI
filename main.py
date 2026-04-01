@@ -20,7 +20,7 @@ import torch
 from config import (
     GRID_WIDTH, GRID_HEIGHT, GRID_SIZE, HUD_HEIGHT,
     GAME_SPEED_HUMAN, GAME_SPEED_AI, GAME_SPEED_TRAINING,
-    DQN_CONFIG, TRAINING_CONFIG, DATABASE_PATH
+    DQN_CONFIG, TRAINING_CONFIG, DATABASE_PATH, CURRICULUM_STAGES,
 )
 from game import GameState, GameController, Direction
 from game.game_controller import GameMode
@@ -157,9 +157,9 @@ def train_dqn_mode(db_manager: DatabaseManager) -> None:
     print(f"  Train freq  : every {train_freq} step{'s' if train_freq > 1 else ''}")
     print(f"  Visualize   : {'OFF' if visualize_every == 0 else f'every {visualize_every} ep'}")
     if num_workers > 1:
-        print(f"  Workers     : {num_workers} parallel")
+        print(f"  Envs        : {num_workers} vectorized (single process, batch GPU)")
     else:
-        print(f"  Workers     : serial")
+        print(f"  Envs        : serial")
     print(f"{'='*W}\n")
 
     # Timing helper
@@ -176,67 +176,76 @@ def train_dqn_mode(db_manager: DatabaseManager) -> None:
               f"{eps_str}lr: {stats['lr']:.2e} | "
               f"Elapsed: {_fmt_time(elapsed)} | ETA: {_fmt_time(eta)}")
 
-    aborted = False
+    aborted      = False
+    best_score   = 0
+    episodes_run = 0
+    total_time   = 0.0
 
-    # ==================================================================
-    # Parallel training  (num_workers > 1)
-    # ==================================================================
-    if num_workers > 1:
-        from ai.parallel_trainer import ParallelTrainer
+    try:
+        # ==================================================================
+        # Vectorized training  (num_workers > 1)  — curriculum mode
+        # Uses n_envs game instances in a single process with batch GPU
+        # inference.  No IPC, no pickle, no queue — GPU ~70-85% busy.
+        # ==================================================================
+        if num_workers > 1:
+            from ai.curriculum_trainer import CurriculumTrainer
 
-        trainer = ParallelTrainer(
-            agent=agent,
-            num_workers=num_workers,
-            grid_width=GRID_WIDTH,
-            grid_height=GRID_HEIGHT,
-            eps_max=eps_max,
-        )
+            n_envs = num_workers   # UI "ENVS" slider maps directly to n_envs
 
-        def _visualize(a):
-            a.set_eval_mode()
-            game_state.reset()
-            vis_ok = True
-            while vis_ok and not game_state.game_over:
-                for ev in pygame.event.get():
-                    if ev.type == pygame.QUIT:
-                        vis_ok = False
-                    elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                        vis_ok = False
-                action = a.get_action(game_state)
-                game_state.update(action)
-                renderer.render(game_state, a)
-                renderer.clock.tick(30)
-            a.set_train_mode()
+            trainer = CurriculumTrainer(
+                agent       = agent,
+                n_envs      = n_envs,
+                grid_width  = GRID_WIDTH,
+                grid_height = GRID_HEIGHT,
+                eps_max     = eps_max,
+                start_stage = 0 if not resuming else 2,
+            )
 
-        results = trainer.train(
-            num_episodes=num_episodes,
-            max_steps=max_steps,
-            train_freq=train_freq,
-            save_path=model_path,
-            visualize_every=visualize_every,
-            visualize_fn=_visualize if visualize_every > 0 else None,
-            on_log=_log_line,
-        )
+            def _visualize(a):
+                a.set_eval_mode()
+                game_state.reset()
+                vis_ok = True
+                while vis_ok and not game_state.game_over:
+                    for ev in pygame.event.get():
+                        if ev.type == pygame.QUIT:
+                            vis_ok = False
+                        elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                            vis_ok = False
+                    action = a.get_action(game_state)
+                    game_state.update(action)
+                    renderer.render(game_state, a)
+                    renderer.clock.tick(30)
+                a.set_train_mode()
 
-        best_score   = results["best_score"]
-        total_time   = results["elapsed"]
-        episodes_run = results["episodes"]
-        aborted      = episodes_run < num_episodes
+            print(f"  Envs        : {n_envs} vectorized  |  batch={agent.batch_size}")
 
-    # ==================================================================
-    # Serial training  (num_workers == 1)
-    # ==================================================================
-    else:
-        controller = GameController(
-            game_state=game_state, renderer=renderer, agent=agent,
-            db_manager=db_manager, mode=GameMode.DQN_TRAINING, game_speed=0,
-        )
-        best_score = 0
-        scores: list = []
-        train_start = _time.time()
-        ep_times: list = []
+            results = trainer.train(
+                num_episodes    = num_episodes,
+                max_steps       = max_steps,
+                train_freq      = train_freq,
+                save_path       = model_path,
+                visualize_every = visualize_every,
+                visualize_fn    = _visualize if visualize_every > 0 else None,
+                on_log          = _log_line,
+            )
 
-        try:
+            best_score   = results["best_score"]
+            total_time   = results["elapsed"]
+            episodes_run = results["episodes"]
+            aborted      = results.get("aborted", episodes_run < num_episodes)
+
+        # ==================================================================
+        # Serial training  (num_workers == 1)
+        # ==================================================================
+        else:
+            controller = GameController(
+                game_state=game_state, renderer=renderer, agent=agent,
+                db_manager=db_manager, mode=GameMode.DQN_TRAINING, game_speed=0,
+            )
+            scores: list = []
+            train_start = _time.time()
+            ep_times: list = []
+
             for episode in range(num_episodes):
                 ep_t0 = _time.time()
                 score, _ = controller.run_training_episode(
@@ -285,14 +294,14 @@ def train_dqn_mode(db_manager: DatabaseManager) -> None:
                     if aborted:
                         break
 
-        except KeyboardInterrupt:
-            print("\n  Training interrupted by user — saving...")
-            aborted = True
+            total_time   = _time.time() - train_start
+            episodes_run = len(scores)
 
-        total_time   = _time.time() - train_start
-        episodes_run = len(scores)
+    except KeyboardInterrupt:
+        print("\n  Training interrupted — saving...")
+        aborted = True
 
-    # --- Final summary (both paths) ---
+    # --- Final summary (both paths) — always reached via finally semantics ---
     os.makedirs("saved_models", exist_ok=True)
     agent.save_model(model_path)
     agent.save_buffer(buffer_path)

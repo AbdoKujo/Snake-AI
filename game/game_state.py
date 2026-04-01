@@ -45,10 +45,10 @@ class GameState:
         self.snake.reset(Point(start_x, start_y), self.initial_snake_length)
         self.food.spawn(self.snake.get_body_set())
 
-        self.score     = 0
-        self.moves     = 0
-        self.game_over = False
-        self.won       = False
+        self.score      = 0
+        self.moves      = 0
+        self.game_over  = False
+        self.won        = False
         self.start_time = time.time()
 
     # ------------------------------------------------------------------
@@ -59,11 +59,28 @@ class GameState:
         """
         Met à jour l'état du jeu après un mouvement.
 
+        Reward policy — 4 signals, no hidden variables, stable Q-targets
+        ─────────────────────────────────────────────────────────────────
+        Death (any)  : -10.0          flat — no wall/body distinction
+        Eat food     : +10.0          flat — no length/efficiency scaling
+        Approaching  : +0.1/len       self-fading (+0.033 early → +0.001 late)
+        Retreating   : -0.2/len       asymmetric — oscillation net always < 0
+        Victory      : +100.0
+
+        Hard per-food step cap handled by the trainer (not here).
+
+        Oscillation math (length=3):
+          (+0.033 - 0.067) / 2 = -0.017/step  → always a loss
+
         Returns:
             Tuple (done, reward).
         """
         if self.game_over:
             return True, 0.0
+
+        food_pos   = self.food.position
+        old_head_x = self.snake.head.x
+        old_head_y = self.snake.head.y
 
         if action is not None:
             self.snake.change_direction(action)
@@ -71,34 +88,32 @@ class GameState:
         self.snake.move()
         self.moves += 1
 
-        # Collision → death.
-        # Penalty scales with length: longer snake = bigger loss (more progress gone).
-        if self.snake.check_collision(self.grid_width, self.grid_height):
+        gw, gh = self.grid_width, self.grid_height
+
+        # ── Death ────────────────────────────────────────────────────────
+        if self.snake.check_collision(gw, gh):
             self.snake.alive = False
             self.game_over   = True
-            death_penalty    = -10.0 - 0.1 * len(self.snake.body)
-            return True, death_penalty
+            return True, -10.0
 
-        # Dynamic step penalty: inversely proportional to snake length.
-        # Short snake (len 3)  → -0.010  (same pressure as before)
-        # Medium snake (len 10) → -0.003  (less panic, more room to plan)
-        # Long snake (len 30)  → -0.001  (almost no pressure — path is complex)
         snake_len = len(self.snake.body)
-        reward    = -0.03 / max(snake_len, 3)
 
+        # ── Self-fading proximity signal ─────────────────────────────────
+        # Dividing by snake_len means the signal naturally becomes negligible
+        # as the snake grows — food reward (+10) dominates in late game.
+        old_dist = abs(old_head_x - food_pos.x) + abs(old_head_y - food_pos.y)
+        new_dist = abs(self.snake.head.x - food_pos.x) + abs(self.snake.head.y - food_pos.y)
+        if new_dist < old_dist:
+            reward = 0.1 / snake_len    # +0.033 at len=3 → +0.001 at len=100
+        else:
+            reward = -0.2 / snake_len   # -0.067 at len=3 → -0.002 at len=100
+
+        # ── Food eaten ───────────────────────────────────────────────────
         if self.food.is_at(self.snake.head):
-            old_len = snake_len
             self.snake.grow()
             self.score += self.food.value
             reward = 10.0
 
-            # Milestone bonus: +5 every time the snake crosses a multiple of 10.
-            # Provides gradient signal throughout training (not just at unreachable win).
-            new_len = len(self.snake.body)
-            if (new_len // 10) > (old_len // 10):
-                reward += 5.0
-
-            # Victory: grid is full
             if not self.food.spawn(self.snake.get_body_set()):
                 self.won       = True
                 self.game_over = True
@@ -107,89 +122,50 @@ class GameState:
         return False, reward
 
     # ------------------------------------------------------------------
-    # State representation — 14 features
+    # State representation — 3-channel spatial grid (CNN input)
     # ------------------------------------------------------------------
 
     def get_state_representation(self) -> np.ndarray:
         """
-        Build a 14-dimensional state vector for the DQN.
+        Build a 3-channel grid for the CNN-DQN.
 
-        Features:
-          [0-2]  danger flags    (ahead, left, right) — binary
-          [3-5]  open space      (ahead, left, right) — BFS flood-fill, normalised
-          [6-9]  direction       one-hot (UP, DOWN, LEFT, RIGHT)
-          [10-11] food offset    (dx, dy) normalised to [-1, 1]
-          [12]   snake length    normalised to [0, 1]
-          [13]   can_reach_tail  BFS boolean — prevents self-trapping
+        Channels (shape: channels × grid_height × grid_width):
+          [0] Snake body — gradient 1.0 (head) → ~0.1 (tail), 0 elsewhere.
+                           Encodes both the body layout AND movement direction.
+          [1] Food       — 1.0 at food cell, 0 elsewhere.
+          [2] Free space — 1.0 at walkable cells (no body, in-bounds), 0 elsewhere.
 
         Returns:
-            np.ndarray of shape (14,), dtype float32.
+            np.ndarray of shape (channels * grid_height * grid_width,), dtype float32.
+            Flattened so it fits the replay buffer's 1-D state arrays.
+            The CNN reshapes it back to (C, H, W) inside forward().
         """
-        head      = self.snake.head
-        direction = self.snake.direction
-        ddx, ddy  = direction.to_vector()
-        gw, gh    = self.grid_width, self.grid_height
-        hx, hy    = head.x, head.y
+        gw, gh = self.grid_width, self.grid_height
+        grid   = np.zeros((3, gh, gw), dtype=np.float32)
 
-        # Build obstacle set ONCE as (x,y) tuples — shared by all 4 BFS calls.
-        # Avoids creating 4 separate Python sets from get_body_set().
-        body_tuples: Set[tuple] = {(p.x, p.y) for p in self.snake.body}
+        # Channel 0 — snake body gradient --------------------------------
+        # Guard bounds: after a wall-collision the head may sit outside the grid.
+        body  = self.snake.body
+        n     = len(body)
+        for i, p in enumerate(body):
+            if 0 <= p.x < gw and 0 <= p.y < gh:
+                # head (i=0) → 1.0 ; tail (i=n-1) → 0.1
+                grid[0, p.y, p.x] = 1.0 - (i / n) * 0.9
 
-        # Adjacent cell coordinates
-        ax, ay = hx + ddx, hy + ddy          # ahead
-        if direction == Direction.UP:
-            lx, ly, rx, ry = hx - 1, hy,     hx + 1, hy
-        elif direction == Direction.DOWN:
-            lx, ly, rx, ry = hx + 1, hy,     hx - 1, hy
-        elif direction == Direction.LEFT:
-            lx, ly, rx, ry = hx,     hy + 1, hx,     hy - 1
-        else:  # RIGHT
-            lx, ly, rx, ry = hx,     hy - 1, hx,     hy + 1
-
-        # [0-2] Danger: out-of-bounds OR body
-        def _danger(x: int, y: int) -> float:
-            return 1.0 if (x < 0 or x >= gw or y < 0 or y >= gh
-                           or (x, y) in body_tuples) else 0.0
-
-        danger_ahead = _danger(ax, ay)
-        danger_left  = _danger(lx, ly)
-        danger_right = _danger(rx, ry)
-
-        # [3-5] Flood-fill open space — all three share the same obstacle set
-        total_cells = gw * gh
-        space_ahead = self._bfs_count(ax, ay, body_tuples, gw, gh) / total_cells
-        space_left  = self._bfs_count(lx, ly, body_tuples, gw, gh) / total_cells
-        space_right = self._bfs_count(rx, ry, body_tuples, gw, gh) / total_cells
-
-        # [6-9] Direction one-hot
-        dir_up    = 1.0 if direction == Direction.UP    else 0.0
-        dir_down  = 1.0 if direction == Direction.DOWN  else 0.0
-        dir_left  = 1.0 if direction == Direction.LEFT  else 0.0
-        dir_right = 1.0 if direction == Direction.RIGHT else 0.0
-
-        # [10-11] Food offset normalised to [-1, 1]
+        # Channel 1 — food -----------------------------------------------
         food_pos = self.food.position
-        food_dx  = (food_pos.x - hx) / gw
-        food_dy  = (food_pos.y - hy) / gh
+        if food_pos is not None:
+            grid[1, food_pos.y, food_pos.x] = 1.0
 
-        # [12] Snake length normalised
-        snake_length_norm = len(self.snake.body) / total_cells
+        # Channel 2 — free space (1 where the snake can move to) ---------
+        # Fill all cells as free, then mark occupied body cells as 0.
+        # O(snake_length) instead of O(grid_width * grid_height) Python iters.
+        grid[2] = 1.0
+        for p in body:
+            if 0 <= p.x < gw and 0 <= p.y < gh:
+                grid[2, p.y, p.x] = 0.0
 
-        # [13] Can head reach tail? Exclude tail from obstacles (it vacates next step)
-        tail = self.snake.body[-1]
-        tail_t = (tail.x, tail.y)
-        tail_obstacles = body_tuples - {tail_t}
-        can_reach_tail = 1.0 if self._bfs_reaches(
-            hx, hy, tail.x, tail.y, tail_obstacles, gw, gh) else 0.0
-
-        return np.array([
-            danger_ahead, danger_left, danger_right,
-            space_ahead,  space_left,  space_right,
-            dir_up, dir_down, dir_left, dir_right,
-            food_dx, food_dy,
-            snake_length_norm,
-            can_reach_tail,
-        ], dtype=np.float32)
+        return grid.flatten()
 
     # ------------------------------------------------------------------
     # Fast BFS helpers — use raw (x,y) tuples, no Point objects in hot loop

@@ -51,13 +51,6 @@ def _build_params() -> List[Dict[str, Any]]:
         short = name if len(name) <= 22 else name[:20] + ".."
         device_labels["cuda"] = f"GPU  ({short})"
 
-    # Worker count — auto-detect sensible default
-    _cpu_count = _os.cpu_count() or 2
-    _worker_values = [1, 2, 4, 6, 8]
-    _default_w = max(2, min(_cpu_count - 2, 6))
-    if _default_w not in _worker_values:
-        _default_w = min(_worker_values, key=lambda v: abs(v - _default_w))
-
     return [
         {
             "label": "DEVICE",
@@ -68,26 +61,28 @@ def _build_params() -> List[Dict[str, Any]]:
             "is_device": True,
         },
         {
-            "label": "WORKERS",
+            # 1 = serial mode  |  >1 = vectorized (N envs in single process,
+            # batch GPU inference — no IPC, no pickle, GPU ~70-85% busy)
+            "label": "ENVS",
             "key":   "num_workers",
-            "values": _worker_values,
-            "default": _default_w,
-            "fmt": lambda v: "SERIAL" if v == 1 else f"{v} parallel",
+            "values": [1, 8, 16, 24, 32],
+            "default": 16,
+            "fmt": lambda v: "SERIAL" if v == 1 else f"{v} vectorized",
             "is_device": False,
         },
         {
             "label": "EPISODES",
             "key":   "num_episodes",
-            "values": [100, 250, 500, 1000, 2000, 5000],
-            "default": 1000,
+            "values": [100, 250, 500, 1000, 2000, 5000, 10_000, 20_000, 50_000],
+            "default": 10_000,
             "fmt": lambda v: f"{v:,}",
             "is_device": False,
         },
         {
             "label": "MAX STEPS / EPISODE",
             "key":   "max_steps_per_episode",
-            "values": [500, 750, 1000, 1500, 2000, 3000],
-            "default": 1500,
+            "values": [1000, 1500, 2000, 3000, 4500, 6000],
+            "default": 4500,
             "fmt": lambda v: f"{v:,}",
             "is_device": False,
         },
@@ -102,7 +97,7 @@ def _build_params() -> List[Dict[str, Any]]:
         {
             "label": "TRAIN EVERY N STEPS",
             "key":   "train_freq",
-            "values": [1, 2, 4, 8],
+            "values": [1, 2, 4, 8, 16],
             "default": 4,
             "fmt": lambda v: f"every {v} step{'s' if v > 1 else ''}",
             "is_device": False,
