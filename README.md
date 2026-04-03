@@ -244,8 +244,7 @@ Ce projet est développé à des fins éducatives dans le cadre de la Licence 3 
 
 ---
 
-**Développeurs** : HAFDANE Abderrahmane & DAHBI Meriem  
-**Encadrant** : M. Yu Li  
+**Développeurs** : HAFDANE Abderrahmane
 **Année** : 2026
 
 ## 📞 Support
